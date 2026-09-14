@@ -116,7 +116,7 @@ func Start(startCfg *model.StartConfig) (port int, err error) {
 		}
 		apiConfig := storedConfig.API
 		if apiConfig == nil {
-			apiConfig = (&base.APIServerConfig{}).Init()
+			apiConfig = (&base.APIServerConfig{Enable: true}).Init()
 		} else {
 			apiConfig.Init()
 		}

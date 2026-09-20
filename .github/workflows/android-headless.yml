@@ -1,0 +1,149 @@
+name: android-headless-api
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "cmd/**"
+      - "pkg/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/android-headless.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "cmd/**"
+      - "pkg/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/android-headless.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.4"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: phone-armv7
+            goarch: arm
+            goarm: "7"
+            expected: "ELF 32-bit.*ARM"
+          - name: tablet-aarch64
+            goarch: arm64
+            goarm: ""
+            expected: "ELF 64-bit.*ARM aarch64"
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Cross-build headless REST service
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          output="dist/gopeed-api-${{ matrix.name }}"
+          env CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
+            go build -tags nosqlite -trimpath -ldflags="-s -w" -o "$output" ./cmd/api
+          test -s "$output"
+          file "$output" | tee "$output.file"
+          grep -E '${{ matrix.expected }}' "$output.file"
+          sha256sum "$output" | tee "$output.sha256"
+      - name: Smoke REST service under QEMU
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user
+          output="dist/gopeed-api-${{ matrix.name }}"
+          case "$GOARCH" in
+            arm) emulator=qemu-arm ;;
+            arm64) emulator=qemu-aarch64 ;;
+            *) exit 2 ;;
+          esac
+          home="$RUNNER_TEMP/gopeed-home-${{ matrix.name }}"
+          mkdir -p "$home"
+          HOME="$home" "$emulator" "$output" >"$RUNNER_TEMP/gopeed-${{ matrix.name }}.log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:9999/api/v1/info >"$RUNNER_TEMP/info.json"; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/gopeed-${{ matrix.name }}.log" >&2
+            exit 1
+          fi
+          grep -F '"code":0' "$RUNNER_TEMP/info.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gopeed-api-${{ matrix.name }}
+          path: |
+            dist/gopeed-api-${{ matrix.name }}
+            dist/gopeed-api-${{ matrix.name }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish exact Termux artifacts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gopeed-api-*
+          path: dist
+          merge-multiple: true
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short=${GITHUB_SHA:0:12}
+          tag="termux-$short"
+          test -s dist/gopeed-api-phone-armv7
+          test -s dist/gopeed-api-tablet-aarch64
+          test -s dist/gopeed-api-phone-armv7.sha256
+          test -s dist/gopeed-api-tablet-aarch64.sha256
+          {
+            printf 'source_commit\t%s\n' "$GITHUB_SHA"
+            printf 'phone_target\tlinux/arm/v7\n'
+            printf 'tablet_target\tlinux/arm64\n'
+            printf 'acceptance\tQEMU REST /api/v1/info only; no physical Android claim\n'
+          } > dist/SOURCE.tsv
+          gh release create "$tag" \
+            dist/gopeed-api-phone-armv7 \
+            dist/gopeed-api-phone-armv7.sha256 \
+            dist/gopeed-api-tablet-aarch64 \
+            dist/gopeed-api-tablet-aarch64.sha256 \
+            dist/SOURCE.tsv \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Headless Termux REST service $short" \
+            --notes "Static ARMv7 and AArch64 Gopeed REST services built from exact main commit $GITHUB_SHA. QEMU /api/v1/info smoke passed in this workflow; physical Android/Termux execution remains separate." \
+            --prerelease

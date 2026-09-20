@@ -1,0 +1,61 @@
+name: android-headless-api
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "cmd/**"
+      - "pkg/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/android-headless.yml"
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.25.4"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: phone-armv7
+            goarch: arm
+            goarm: "7"
+            expected: "ELF 32-bit.*ARM"
+          - name: tablet-aarch64
+            goarch: arm64
+            goarm: ""
+            expected: "ELF 64-bit.*ARM aarch64"
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Cross-build headless REST service
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          output="dist/gopeed-api-${{ matrix.name }}"
+          env CGO_ENABLED=0 GOOS=android GOARCH="$GOARCH" GOARM="$GOARM" \
+            go build -tags nosqlite -trimpath -ldflags="-s -w" -o "$output" ./cmd/api
+          test -s "$output"
+          file "$output" | tee "$output.file"
+          grep -E '${{ matrix.expected }}' "$output.file"
+          sha256sum "$output" | tee "$output.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gopeed-api-${{ matrix.name }}
+          path: |
+            dist/gopeed-api-${{ matrix.name }}
+            dist/gopeed-api-${{ matrix.name }}.sha256
+          if-no-files-found: error

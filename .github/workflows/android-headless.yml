@@ -46,12 +46,45 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           output="dist/gopeed-api-${{ matrix.name }}"
-          env CGO_ENABLED=0 GOOS=android GOARCH="$GOARCH" GOARM="$GOARM" \
+          env CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" \
             go build -tags nosqlite -trimpath -ldflags="-s -w" -o "$output" ./cmd/api
           test -s "$output"
           file "$output" | tee "$output.file"
           grep -E '${{ matrix.expected }}' "$output.file"
           sha256sum "$output" | tee "$output.sha256"
+      - name: Smoke REST service under QEMU
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user
+          output="dist/gopeed-api-${{ matrix.name }}"
+          case "$GOARCH" in
+            arm) emulator=qemu-arm ;;
+            arm64) emulator=qemu-aarch64 ;;
+            *) exit 2 ;;
+          esac
+          home="$RUNNER_TEMP/gopeed-home-${{ matrix.name }}"
+          mkdir -p "$home"
+          HOME="$home" "$emulator" "$output" >"$RUNNER_TEMP/gopeed-${{ matrix.name }}.log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:9999/api/v1/info >"$RUNNER_TEMP/info.json"; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/gopeed-${{ matrix.name }}.log" >&2
+            exit 1
+          fi
+          grep -F '"code":0' "$RUNNER_TEMP/info.json"
       - uses: actions/upload-artifact@v4
         with:
           name: gopeed-api-${{ matrix.name }}
